@@ -2,8 +2,15 @@
 Retrieval service for GraphSeek application.
 Handles document retrieval with hybrid search, reranking, and GraphRAG.
 """
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 from langchain_core.documents import Document
+
+from core.cache import RetrievalCache
+from utils.monitoring import Monitor
+from utils.logger import get_logger
+
+
+logger = get_logger(__name__)
 
 
 class RetrievalService:
@@ -15,11 +22,20 @@ class RetrievalService:
         reranker=None,
         knowledge_graph=None,
         graph_service=None,
+        cache_enabled: bool = True,
+        cache_ttl: float = 3600.0,
     ) -> None:
         self.ensemble_retriever = ensemble_retriever
         self.reranker = reranker
         self.knowledge_graph = knowledge_graph
         self.graph_service = graph_service
+        
+        # Initialize cache
+        self.cache_enabled = cache_enabled
+        self.cache = RetrievalCache(max_size=1000, default_ttl=cache_ttl) if cache_enabled else None
+        
+        # Initialize monitoring
+        self.monitor = Monitor()
     
     def retrieve(
         self,
@@ -30,6 +46,7 @@ class RetrievalService:
         enable_reranking: bool = True,
         max_contexts: int = 3,
         llm_service=None,
+        use_cache: bool = True,
     ) -> List[Document]:
         """
         Retrieve relevant documents using hybrid search and optional enhancements.
@@ -42,28 +59,69 @@ class RetrievalService:
             enable_reranking: Whether to apply neural reranking
             max_contexts: Maximum number of documents to return
             llm_service: LLM service for HyDE expansion
+            use_cache: Whether to use cached results
             
         Returns:
             List of retrieved documents
         """
-        expanded_query = self._expand_query(
-            query,
-            chat_history,
-            enable_hyde,
-            llm_service,
-        )
+        # Check cache first
+        cache_key_params = {
+            "chat_history": chat_history,
+            "enable_hyde": enable_hyde,
+            "enable_graph_rag": enable_graph_rag,
+            "enable_reranking": enable_reranking,
+            "max_contexts": max_contexts,
+        }
         
-        docs = self.ensemble_retriever.invoke(expanded_query)
+        if use_cache and self.cache_enabled and self.cache:
+            cached_result = self.cache.get(query, **cache_key_params)
+            if cached_result:
+                logger.info(f"Cache hit for query: {query[:50]}...")
+                return cached_result
         
-        if enable_graph_rag and self.graph_service:
-            graph_docs = self._retrieve_from_graph(query)
-            if graph_docs:
-                docs = graph_docs + docs
-        
-        if enable_reranking and self.reranker:
-            docs = self._rerank_documents(query, docs)
-        
-        return docs[:max_contexts]
+        with self.monitor.measure("retrieval.retrieve"):
+            expanded_query = self._expand_query(
+                query,
+                chat_history,
+                enable_hyde,
+                llm_service,
+            )
+            
+            docs = self.ensemble_retriever.invoke(expanded_query)
+            
+            if enable_graph_rag and self.graph_service:
+                graph_docs = self._retrieve_from_graph(query)
+                if graph_docs:
+                    docs = graph_docs + docs
+            
+            if enable_reranking and self.reranker:
+                docs = self._rerank_documents(query, docs)
+            
+            result_docs = docs[:max_contexts]
+            
+            # Cache the result
+            if use_cache and self.cache_enabled and self.cache:
+                self.cache.set(
+                    query,
+                    result_docs,
+                    metadata={"doc_count": len(result_docs)},
+                    **cache_key_params
+                )
+            
+            return result_docs
+    
+    def get_cache_stats(self) -> Optional[Dict[str, Any]]:
+        """Get cache statistics."""
+        if self.cache:
+            return self.cache.get_stats()
+        return None
+    
+    def clear_cache(self) -> bool:
+        """Clear the retrieval cache."""
+        if self.cache:
+            self.cache.clear()
+            return True
+        return False
     
     def _expand_query(
         self,
