@@ -5,6 +5,7 @@ __pycache__/
 
 # Dependencies
 .venv/
+.trae/
 venv/
 node_modules/
 

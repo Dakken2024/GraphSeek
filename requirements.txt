@@ -1,17 +1,40 @@
-streamlit
-networkx
-torch
-requests
-numpy
-pandas
-langchain-community
-langchain-core
-langchain-ollama
-faiss-cpu
-sentence-transformers
-rank-bm25
-pydantic
-PyMuPDF
-docx2txt
-tqdm
-pypdf
+# GraphSeek 2026 - Python 3.12+ compatible dependency manifest
+# LLM 多后端网关（Ollama / OpenAI 兼容 / vLLM / 硅基流动 / ModelScope）
+openai>=1.40
+httpx>=0.27
+python-dotenv>=1.0
+
+# LangChain classic 0.3 line（与项目现有 API 兼容，勿升级至 1.x）
+langchain==0.3.28
+langchain-community==0.3.29
+langchain-core==0.3.86
+langchain-ollama==0.3.10
+langchain-text-splitters==0.3.11
+
+# Web UI
+streamlit>=1.37
+
+# Vector / Retrieval
+faiss-cpu>=1.8
+rank-bm25>=0.2
+sentence-transformers>=4.0   # 轻量 ColBERT 接入（colbert-ir/colbertv2.0）
+
+# Graph
+networkx>=3.2
+python-louvain>=0.16        # 社区检测（LightRAG High-level 摘要图）
+
+# Core / ML
+torch>=2.0
+numpy>=1.24
+pandas>=1.5
+pydantic>=2.6
+requests>=2.31
+tqdm>=4.60
+
+# Document parsing
+PyMuPDF>=1.24
+docx2txt>=0.8
+pypdf>=4.0
+
+# Testing
+pytest>=8.0

@@ -1,6 +1,7 @@
 """
 Document processing service for GraphSeek application.
 Handles document loading, splitting, and indexing operations.
+Enhanced with LLM-driven graph extraction and community summary index.
 """
 import os
 import re
@@ -13,7 +14,7 @@ from langchain_community.retrievers import BM25Retriever
 from langchain.retrievers import EnsembleRetriever
 from rank_bm25 import BM25Okapi
 
-from services.graph_service import KnowledgeGraphService
+from services.graph_service import KnowledgeGraphService, LLMEntityExtractor
 
 
 class DocumentProcessingService:
@@ -47,6 +48,9 @@ class DocumentProcessingService:
         self,
         uploaded_files: List,
         reranker: Optional = None,
+        llm_service: Optional = None,
+        enable_communities: bool = True,
+        graph_path: Optional[str] = None,
     ) -> dict:
         """
         Process uploaded files and create retrieval pipeline.
@@ -54,6 +58,9 @@ class DocumentProcessingService:
         Args:
             uploaded_files: List of uploaded file objects
             reranker: Optional reranker model for neural ranking
+            llm_service: LLM 服务（用于 LLM 驱动图谱抽取与社区摘要）
+            enable_communities: 是否构建社区摘要（High-level 索引）
+            graph_path: 图谱持久化路径
             
         Returns:
             Dictionary containing retrieval pipeline components
@@ -79,15 +86,23 @@ class DocumentProcessingService:
             weights=[self.bm25_weight, self.faiss_weight],
         )
         
-        graph_service = KnowledgeGraphService()
-        knowledge_graph = graph_service.build_graph(texts)
+        # 图谱构建：LLM 驱动抽取 + 增量 merge（无 LLM 时自动降级正则）
+        llm_extractor = LLMEntityExtractor(llm_service=llm_service) if llm_service else None
+        graph_service = KnowledgeGraphService(persistence_path=graph_path)
+        knowledge_graph = graph_service.build_graph(texts, llm_extractor=llm_extractor)
+        
+        # High-level 社区摘要索引（LightRAG 双层）
+        if enable_communities and len(knowledge_graph) > 0:
+            graph_service.build_community_summaries(llm_service=llm_service)
         
         return {
             "ensemble": ensemble_retriever,
             "reranker": reranker,
             "texts": text_contents,
+            "documents": texts,
             "knowledge_graph": knowledge_graph,
             "graph_service": graph_service,
+            "llm_service": llm_service,
         }
     
     def _load_documents(self, uploaded_files: List) -> List:

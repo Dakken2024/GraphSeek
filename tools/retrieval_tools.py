@@ -28,7 +28,9 @@ class DocumentSearchTool(Tool):
                 )
             
             top_k = k or self.max_results
-            docs = self.ensemble_retriever.invoke(query, k=top_k)
+            # langchain 0.3 不支持 invoke 传 k，通过 search_kwargs 控制
+            self.ensemble_retriever.search_kwargs = {"k": top_k}
+            docs = self.ensemble_retriever.invoke(query)
             
             results = [
                 {
@@ -89,8 +91,9 @@ class HybridSearchTool(Tool):
     ) -> ToolResult:
         """Execute hybrid search with enhancements."""
         try:
-            # Base retrieval
-            docs = self.ensemble_retriever.invoke(query, k=top_k * 2)
+            # Base retrieval（langchain 0.3 通过 search_kwargs 控制 top_k）
+            self.ensemble_retriever.search_kwargs = {"k": top_k * 2}
+            docs = self.ensemble_retriever.invoke(query)
             
             # GraphRAG enhancement
             graph_docs = []

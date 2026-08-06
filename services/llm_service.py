@@ -1,368 +1,147 @@
 """
-LLM service for GraphSeek application.
-Handles interactions with Ollama API for text generation and embeddings.
-Enhanced with async support, retry mechanism, and token statistics.
-"""
-import json
-import asyncio
-from typing import Generator, Optional, Dict, Any, List
-from functools import wraps
-import time
-import hashlib
-from dataclasses import dataclass, field
-import requests
-from requests.adapters import HTTPAdapter, Retry
+LLM Service for GraphSeek application.
 
+基于 LLMGateway 的兼容层：保持原有公开 API（generate_response / generate_non_streaming /
+generate_hypothetical_answer / check_models / get_token_stats）不变，底层统一走多后端网关。
+新增 generate_structured 结构化输出能力（白皮书：原生结构化输出）。
+"""
+from typing import Generator, Optional, Dict, Any, List, Type, TypeVar
+import asyncio
+
+from services.llm_gateway import (
+    LLMGateway,
+    OllamaBackend,
+    MockBackend,
+    BackendConfigError,
+)
 from utils.logger import get_logger
-from utils.monitoring import Monitor
+from pydantic import BaseModel
 
 
 logger = get_logger(__name__)
 
-
-@dataclass
-class TokenStats:
-    """Statistics for token usage."""
-    prompt_tokens: int = 0
-    completion_tokens: int = 0
-    total_tokens: int = 0
-    request_count: int = 0
-    
-    def add_completion(self, token_count: int) -> None:
-        """Add completion tokens."""
-        self.completion_tokens += token_count
-        self.total_tokens += token_count
-        self.request_count += 1
-    
-    def add_prompt(self, token_count: int) -> None:
-        """Add prompt tokens."""
-        self.prompt_tokens += token_count
-        self.total_tokens += token_count
-    
-    def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary."""
-        return {
-            "prompt_tokens": self.prompt_tokens,
-            "completion_tokens": self.completion_tokens,
-            "total_tokens": self.total_tokens,
-            "request_count": self.request_count,
-            "avg_completion_tokens": round(self.completion_tokens / self.request_count, 2) if self.request_count > 0 else 0,
-        }
-
-
-def retry_with_backoff(max_retries: int = 3, backoff_factor: float = 0.5):
-    """Decorator for retrying failed requests with exponential backoff."""
-    def decorator(func):
-        @wraps(func)
-        def wrapper(*args, **kwargs):
-            last_exception = None
-            for attempt in range(max_retries + 1):
-                try:
-                    return func(*args, **kwargs)
-                except (requests.exceptions.RequestException, requests.exceptions.Timeout) as e:
-                    last_exception = e
-                    if attempt < max_retries:
-                        wait_time = backoff_factor * (2 ** attempt)
-                        logger.warning(
-                            f"Request failed (attempt {attempt + 1}/{max_retries + 1}), "
-                            f"retrying in {wait_time:.2f}s: {str(e)}"
-                        )
-                        time.sleep(wait_time)
-                    else:
-                        logger.error(f"Request failed after {max_retries + 1} attempts: {str(e)}")
-            raise last_exception
-        return wrapper
-    return decorator
-
-
-DEFAULT_BACKOFF_FACTOR = 0.5
+T = TypeVar("T", bound=BaseModel)
 
 
 class LLMService:
-    """Service for interacting with Ollama LLM API with enhanced features."""
-    
+    """与后端网关解耦的 LLM 服务兼容层。"""
+
     def __init__(
-        self, 
-        api_url: str, 
+        self,
+        api_url: str,
         model: str,
         timeout: int = 120,
         max_retries: int = 3,
         enable_token_stats: bool = True,
+        gateway: Optional[LLMGateway] = None,
     ) -> None:
         self.api_url = api_url
         self.model = model
-        self.timeout = timeout
-        self.max_retries = max_retries
-        self.enable_token_stats = enable_token_stats
-        
-        # Setup session with retry strategy
-        self.session = requests.Session()
-        retry_strategy = Retry(
-            total=max_retries,
-            backoff_factor=DEFAULT_BACKOFF_FACTOR,
-            status_forcelist=[429, 500, 502, 503, 504],
-            allowed_methods=["POST", "GET"],
-        )
-        adapter = HTTPAdapter(max_retries=retry_strategy)
-        self.session.mount("http://", adapter)
-        self.session.mount("https://", adapter)
-        
-        # Token statistics
-        self.token_stats = TokenStats() if enable_token_stats else None
-        
-        # Monitoring
-        self.monitor = Monitor()
-    
-    def _estimate_tokens(self, text: str) -> int:
-        """Estimate token count from text (rough approximation)."""
-        # Simple heuristic: ~4 characters per token for English
-        return len(text) // 4
-    
+
+        if gateway is not None:
+            self.gateway = gateway
+        else:
+            # 环境变量优先（LLM_BACKEND/LLM_API_KEY...），默认 Ollama 保持旧行为
+            import os
+            backend_name = os.getenv("LLM_BACKEND", "ollama").strip().lower()
+            if backend_name == "openai":
+                try:
+                    self.gateway = LLMGateway.from_environment()
+                    model = self.gateway.model
+                    self.model = model
+                except BackendConfigError as e:
+                    logger.warning(f"OpenAI 后端初始化失败，回退 Ollama: {e}")
+                    self.gateway = LLMGateway(
+                        backend=OllamaBackend(model=model, base_url=api_url.replace("/api/generate", ""),
+                                              timeout=timeout),
+                        max_retries=max_retries,
+                        enable_token_stats=enable_token_stats,
+                    )
+            elif backend_name == "mock":
+                self.gateway = LLMGateway(backend=MockBackend(model=model),
+                                          max_retries=max_retries,
+                                          enable_token_stats=enable_token_stats)
+            else:
+                self.gateway = LLMGateway(
+                    backend=OllamaBackend(model=model, base_url=api_url.replace("/api/generate", ""),
+                                          timeout=timeout),
+                    max_retries=max_retries,
+                    enable_token_stats=enable_token_stats,
+                )
+
+    # -- 兼容旧 API --------------------------------------------------------
+
     def check_models(self, required_models: list) -> dict:
-        """
-        Check if required models are available in Ollama.
-        
-        Args:
-            required_models: List of required model names
-            
-        Returns:
-            Dictionary with availability status and missing models
-        """
-        try:
-            base_url = self.api_url.replace("/api/generate", "")
-            response = self.session.get(f"{base_url}/api/tags", timeout=self.timeout)
-            response.raise_for_status()
-            available_models = [model['model'] for model in response.json()['models']]
-            
-            missing_models = [model for model in required_models if model not in available_models]
-            
-            return {
-                "available": len(missing_models) == 0,
-                "missing_models": missing_models,
-                "all_models": available_models,
-            }
-        except Exception as e:
-            logger.error(f"Failed to check models: {str(e)}")
-            return {
-                "available": False,
-                "error": str(e),
-            }
-    
-    @retry_with_backoff()
+        return self.gateway.check_models(required_models)
+
     def generate_hypothetical_answer(self, query: str) -> str:
         """
-        Generate a hypothetical answer for HyDE query expansion.
-        
-        Args:
-            query: Original query string
-            
-        Returns:
-            Generated hypothetical answer or original query if failed
+        HyDE 假设性文档生成（保留供旧链路调用；新链路由 QueryPlanner 替代）。
         """
-        with self.monitor.measure("llm.generate_hypothetical"):
-            try:
-                response = self.session.post(
-                    self.api_url,
-                    json={
-                        "model": self.model,
-                        "prompt": f"Generate a hypothetical answer to: {query}",
-                        "stream": False,
-                    },
-                    timeout=self.timeout,
-                ).json()
-                
-                result = response.get("response", query)
-                
-                # Update token stats
-                if self.token_stats:
-                    self.token_stats.add_prompt(self._estimate_tokens(query))
-                    self.token_stats.add_completion(self._estimate_tokens(result))
-                
-                return result
-            except Exception as e:
-                logger.error(f"Hypothetical answer generation failed: {str(e)}")
-                return query
-    
+        prompt = (
+            "Generate a hypothetical passage that would answer the question. "
+            "It should be factual, concise and in the same style as a source document.\n"
+            f"Question: {query}\nPassage:"
+        )
+        return self.gateway.generate(prompt, temperature=0.3, max_tokens=512)
+
     def generate_response(
         self,
         prompt: str,
         temperature: float = 0.3,
         max_context: int = 4096,
     ) -> Generator[str, None, None]:
-        """
-        Stream a response from the LLM.
-        
-        Args:
-            prompt: Input prompt for generation
-            temperature: Temperature parameter for generation
-            max_context: Maximum context window size
-            
-        Yields:
-            Generated tokens as strings
-        """
-        with self.monitor.measure("llm.generate_stream"):
-            token_count = 0
-            try:
-                response = self.session.post(
-                    self.api_url,
-                    json={
-                        "model": self.model,
-                        "prompt": prompt,
-                        "stream": True,
-                        "options": {
-                            "temperature": temperature,
-                            "num_ctx": max_context,
-                        },
-                    },
-                    stream=True,
-                    timeout=self.timeout,
-                )
-                response.raise_for_status()
-                
-                for line in response.iter_lines():
-                    if line:
-                        try:
-                            data = json.loads(line.decode())
-                            token = data.get("response", "")
-                            yield token
-                            
-                            if token:
-                                token_count += 1
-                            
-                            if data.get("done", False):
-                                # Update token stats if available from response
-                                if self.token_stats and "prompt_eval_count" in data:
-                                    self.token_stats.add_prompt(data.get("prompt_eval_count", 0))
-                                    self.token_stats.add_completion(data.get("eval_count", token_count))
-                                break
-                        except json.JSONDecodeError:
-                            continue
-            except Exception as e:
-                logger.error(f"Stream generation failed: {str(e)}")
-                yield f"[Error: {str(e)}]"
-            
-            # Fallback token estimation
-            if self.token_stats and token_count > 0:
-                self.token_stats.add_prompt(self._estimate_tokens(prompt))
-                self.token_stats.add_completion(token_count)
-    
+        yield from self.gateway.generate_stream(prompt, temperature, max_context)
+
     async def generate_response_async(
         self,
         prompt: str,
         temperature: float = 0.3,
         max_context: int = 4096,
     ):
-        """
-        Async version of generate_response for non-blocking operations.
-        
-        Args:
-            prompt: Input prompt for generation
-            temperature: Temperature parameter for generation
-            max_context: Maximum context window size
-            
-        Yields:
-            Generated tokens as strings
-        """
-        import aiohttp
-        
-        with self.monitor.measure("llm.generate_async"):
-            token_count = 0
-            try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.post(
-                        self.api_url,
-                        json={
-                            "model": self.model,
-                            "prompt": prompt,
-                            "stream": True,
-                            "options": {
-                                "temperature": temperature,
-                                "num_ctx": max_context,
-                            },
-                        },
-                        timeout=aiohttp.ClientTimeout(total=self.timeout),
-                    ) as response:
-                        async for line in response.content:
-                            if line:
-                                try:
-                                    data = json.loads(line.decode())
-                                    token = data.get("response", "")
-                                    yield token
-                                    
-                                    if token:
-                                        token_count += 1
-                                    
-                                    if data.get("done", False):
-                                        if self.token_stats and "prompt_eval_count" in data:
-                                            self.token_stats.add_prompt(data.get("prompt_eval_count", 0))
-                                            self.token_stats.add_completion(data.get("eval_count", token_count))
-                                        break
-                                except json.JSONDecodeError:
-                                    continue
-            except Exception as e:
-                logger.error(f"Async generation failed: {str(e)}")
-                yield f"[Error: {str(e)}]"
-            
-            if self.token_stats and token_count > 0:
-                self.token_stats.add_prompt(self._estimate_tokens(prompt))
-                self.token_stats.add_completion(token_count)
-    
+        """异步版本：通过线程池执行非流式生成后按 chunk 产出。"""
+        loop = asyncio.get_event_loop()
+        text = await loop.run_in_executor(
+            None, self.gateway.generate, prompt, temperature, max_context
+        )
+        for i in range(0, len(text), 64):
+            yield text[i : i + 64]
+
     def generate_non_streaming(
         self,
         prompt: str,
         temperature: float = 0.3,
         max_context: int = 4096,
     ) -> str:
-        """
-        Generate a complete response without streaming.
-        
-        Args:
-            prompt: Input prompt for generation
-            temperature: Temperature parameter for generation
-            max_context: Maximum context window size
-            
-        Returns:
-            Complete generated response
-        """
-        with self.monitor.measure("llm.generate_non_streaming"):
-            try:
-                response = self.session.post(
-                    self.api_url,
-                    json={
-                        "model": self.model,
-                        "prompt": prompt,
-                        "stream": False,
-                        "options": {
-                            "temperature": temperature,
-                            "num_ctx": max_context,
-                        },
-                    },
-                    timeout=self.timeout,
-                ).json()
-                
-                result = response.get("response", "")
-                
-                # Update token stats
-                if self.token_stats:
-                    self.token_stats.add_prompt(response.get("prompt_eval_count", self._estimate_tokens(prompt)))
-                    self.token_stats.add_completion(response.get("eval_count", self._estimate_tokens(result)))
-                
-                return result
-            except Exception as e:
-                logger.error(f"Non-streaming generation failed: {str(e)}")
-                raise
-    
+        return self.gateway.generate(prompt, temperature, max_context)
+
+    # -- 新增能力 ----------------------------------------------------------
+
+    def generate_structured(
+        self,
+        prompt: str,
+        schema: Type[T],
+        temperature: float = 0.1,
+        max_tokens: int = 4096,
+        max_attempts: int = 2,
+    ) -> T:
+        """Pydantic 结构化输出（白皮书：原生结构化输出，消灭正则解析）。"""
+        return self.gateway.generate_structured(
+            prompt, schema, temperature=temperature,
+            max_tokens=max_tokens, max_attempts=max_attempts,
+        )
+
+    @property
+    def backend_name(self) -> str:
+        return self.gateway.backend_name
+
+    # -- 统计 --------------------------------------------------------------
+
     def get_token_stats(self) -> Optional[Dict[str, Any]]:
-        """Get token usage statistics."""
-        if self.token_stats:
-            return self.token_stats.to_dict()
-        return None
-    
+        return self.gateway.get_token_stats()
+
     def reset_token_stats(self) -> None:
-        """Reset token statistics."""
-        if self.token_stats:
-            self.token_stats = TokenStats()
-    
+        self.gateway.reset_token_stats()
+
     def close(self) -> None:
-        """Close the session."""
-        self.session.close()
+        self.gateway.close()
